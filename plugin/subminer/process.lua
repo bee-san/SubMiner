@@ -88,9 +88,9 @@ function M.create(ctx)
 			selected = opts.backend
 		end
 		if selected == "auto" then
-			return environment.detect_backend()
+			return environment.detect_backend(), selected
 		end
-		return selected
+		return selected, selected
 	end
 
 	local function clear_auto_play_ready_timeout()
@@ -301,6 +301,14 @@ function M.create(ctx)
 			end
 			subminer_log("info", "process", "Overlay already running")
 			show_osd("Already running")
+			return
+		end
+
+		local backend, configured_backend = resolve_backend(overrides.backend)
+		if configured_backend == "auto" and (backend == nil or backend == "") then
+			subminer_log("warn", "process", "Overlay start skipped: no supported backend detected")
+			show_osd("Unsupported desktop backend")
+			release_auto_play_ready_gate("unsupported-backend")
 			return
 		end
 

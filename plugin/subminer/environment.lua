@@ -186,12 +186,12 @@ function M.create(ctx)
 				or string.find(string.lower(os.getenv("XDG_SESSION_DESKTOP") or ""), "plasma", 1, true)
 			) then
 			backend = "kwin"
-		elseif os.getenv("XDG_SESSION_TYPE") == "x11" or os.getenv("DISPLAY") then
-			backend = "x11"
-		else
-			subminer_log("warn", "backend", "Could not detect window manager, falling back to x11")
-			backend = "x11"
-		end
+			elseif os.getenv("XDG_SESSION_TYPE") == "x11" or os.getenv("DISPLAY") then
+				backend = "x11"
+			else
+				subminer_log("warn", "backend", "Could not detect a supported window manager backend")
+				backend = nil
+			end
 
 		detected_backend = backend
 		if backend then

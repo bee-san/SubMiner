@@ -43,11 +43,13 @@ type KWinLoadedScript = {
 export interface KWinWindow {
   active?: boolean;
   caption?: string;
+  hidden?: boolean;
   minimized?: boolean;
   normalWindow?: boolean;
   pid?: number;
   resourceClass?: string;
   resourceName?: string;
+  visible?: boolean;
   x?: number;
   y?: number;
   width?: number;
@@ -56,6 +58,7 @@ export interface KWinWindow {
 
 interface KWinUpdatePayload {
   degraded?: boolean;
+  selectionBlocked?: boolean;
   window?: KWinWindow | null;
   windows?: KWinWindow[];
 }
@@ -93,16 +96,60 @@ function normalizeWindowText(value: string | undefined): string {
   return value?.trim().toLowerCase() ?? '';
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function matchesTargetSocketArgs(args: string[], targetMpvSocketPath: string): boolean {
+  for (let i = 0; i < args.length; i += 1) {
+    const argument = args[i];
+    if (!argument) {
+      continue;
+    }
+
+    if (argument === `--input-ipc-server=${targetMpvSocketPath}`) {
+      return true;
+    }
+
+    if (argument === '--input-ipc-server' && args[i + 1] === targetMpvSocketPath) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasDelimitedCommandLineMatch(commandLine: string, candidate: string): boolean {
+  let startIndex = commandLine.indexOf(candidate);
+  while (startIndex >= 0) {
+    const endIndex = startIndex + candidate.length;
+    const hasLeadingBoundary = startIndex === 0 || /\s/.test(commandLine[startIndex - 1]!);
+    const hasTrailingBoundary =
+      endIndex === commandLine.length || /\s/.test(commandLine[endIndex]!);
+
+    if (hasLeadingBoundary && hasTrailingBoundary) {
+      return true;
+    }
+
+    startIndex = commandLine.indexOf(candidate, startIndex + 1);
+  }
+
+  return false;
 }
 
 function matchesTargetSocket(commandLine: string, targetMpvSocketPath: string): boolean {
-  const escapedTarget = escapeRegExp(targetMpvSocketPath);
-  const pattern = new RegExp(
-    `(?:^|\\s)--input-ipc-server(?:=|\\s+)(?:"${escapedTarget}"|'${escapedTarget}'|${escapedTarget})(?=\\s|$)`,
-  );
-  return pattern.test(commandLine);
+  if (commandLine.includes('\0')) {
+    return matchesTargetSocketArgs(
+      commandLine.split('\0').filter((value) => value.length > 0),
+      targetMpvSocketPath,
+    );
+  }
+
+  const candidates = [
+    `--input-ipc-server=${targetMpvSocketPath}`,
+    `--input-ipc-server ${targetMpvSocketPath}`,
+    `--input-ipc-server="${targetMpvSocketPath}"`,
+    `--input-ipc-server='${targetMpvSocketPath}'`,
+    `--input-ipc-server "${targetMpvSocketPath}"`,
+    `--input-ipc-server '${targetMpvSocketPath}'`,
+  ];
+  return candidates.some((candidate) => hasDelimitedCommandLineMatch(commandLine, candidate));
 }
 
 function preferActiveKWinWindow(windows: KWinWindow[]): KWinWindow | null {
@@ -126,6 +173,10 @@ function hasValidGeometry(window: KWinWindow): boolean {
   );
 }
 
+function isVisibleKWinWindow(window: KWinWindow): boolean {
+  return window.minimized !== true && window.visible !== false && window.hidden !== true;
+}
+
 export function selectKWinMpvWindow(
   windows: KWinWindow[],
   options: SelectKWinMpvWindowOptions,
@@ -133,7 +184,7 @@ export function selectKWinMpvWindow(
   const visibleMpvWindows = windows.filter(
     (window) =>
       window.normalWindow !== false &&
-      window.minimized !== true &&
+      isVisibleKWinWindow(window) &&
       isMpvWindow(window) &&
       hasValidGeometry(window),
   );
@@ -188,27 +239,21 @@ KWinTrackerBridgeInterface.configureMembers({
 export function buildKWinBridgeScript(
   serviceName: string,
   targetMpvPid: number | null = null,
+  requireTargetMpvPid: boolean = false,
 ): string {
   return `
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
 const OBJECT_PATH = ${JSON.stringify(BRIDGE_OBJECT_PATH)};
 const INTERFACE_NAME = ${JSON.stringify(BRIDGE_INTERFACE_NAME)};
-const OVERLAY_OWNER_PID = ${JSON.stringify(process.pid)};
 const TARGET_MPV_PID = ${JSON.stringify(targetMpvPid)};
-const OVERLAY_WINDOW_CAPTION = "SubMiner";
+const REQUIRE_TARGET_MPV_PID = ${JSON.stringify(requireTargetMpvPid)};
 const trackedWindows = new WeakSet();
-const overlayKeepAboveState = [];
-const overlayHiddenByScript = [];
-const eventSuppressions = [];
-const MAX_SYNC_PASSES_PER_DRAIN = 32;
+const geometryWatchedWindows = new WeakSet();
+const geometryPreference = new WeakMap();
 const MAX_BRIDGE_PAYLOAD_BYTES = 32768;
 let bridgeDisabled = false;
 let bridgeDegradedStateEmitted = false;
 let lastEmittedPayload = "";
-let queuedPairSync = false;
-let queuedSyncTriggerWindow = null;
-let queuedSyncTriggerEvent = "";
-let drainingPairSync = false;
 
 function isWatchableWindow(window) {
   try {
@@ -234,18 +279,6 @@ function isWatchableWindow(window) {
   return true;
 }
 
-function isTrackableOverlayWindow(window) {
-  if (!isWatchableWindow(window)) {
-    return false;
-  }
-
-  if (Number(window.pid || 0) !== OVERLAY_OWNER_PID) {
-    return false;
-  }
-
-  return String(window.caption || "") === OVERLAY_WINDOW_CAPTION;
-}
-
 function isMpvWindow(window) {
   if (!isWatchableWindow(window)) {
     return false;
@@ -261,93 +294,55 @@ function isMpvWindow(window) {
   return false;
 }
 
-function isTrackableWindow(window) {
-  return isMpvWindow(window) || isTrackableOverlayWindow(window);
+function isOverlayWindow(window) {
+  const values = [window.resourceClass, window.resourceName, window.caption];
+  for (const value of values) {
+    if (String(value || "").toLowerCase().includes("subminer")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function primeGeometryPreference(window) {
+  if (window.clientGeometry) {
+    geometryPreference.set(window, "client");
+    return;
+  }
+  if (window.frameGeometry) {
+    geometryPreference.set(window, "frame");
+  }
 }
 
 function getWindowGeometry(window) {
+  const preferredGeometry = geometryPreference.get(window);
+  if (preferredGeometry === "frame" && window.frameGeometry) {
+    return window.frameGeometry;
+  }
+  if (preferredGeometry === "client" && window.clientGeometry) {
+    return window.clientGeometry;
+  }
   return window.clientGeometry || window.frameGeometry || {};
 }
 
-function serializeWindow(window, activeOverride) {
+function serializeWindow(window) {
   const geometry = getWindowGeometry(window);
   return {
-    active: activeOverride === undefined ? window.active === true : activeOverride === true,
+    active: window.active === true,
     caption: String(window.caption || ""),
+    hidden: window.hidden === true ? true : undefined,
     minimized: window.minimized === true,
     normalWindow: window.normalWindow === true,
     pid: Number(window.pid || 0),
     resourceClass: String(window.resourceClass || ""),
     resourceName: String(window.resourceName || ""),
+    visible: window.visible === false ? false : undefined,
     x: Number(geometry.x || 0),
     y: Number(geometry.y || 0),
     width: Number(geometry.width || 0),
     height: Number(geometry.height || 0),
   };
-}
-
-function windowRefIndex(entries, window) {
-  for (let i = 0; i < entries.length; i += 1) {
-    if (entries[i].window === window) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-function ensureOverlayStateEntry(entries, window, value) {
-  const index = windowRefIndex(entries, window);
-  if (index >= 0) {
-    return entries[index];
-  }
-
-  const entry = {
-    window: window,
-    value: value,
-  };
-  entries.push(entry);
-  return entry;
-}
-
-function removeOverlayStateEntry(entries, window) {
-  const index = windowRefIndex(entries, window);
-  if (index >= 0) {
-    entries.splice(index, 1);
-  }
-}
-
-function readOverlayStateEntry(entries, window) {
-  const index = windowRefIndex(entries, window);
-  if (index >= 0) {
-    return entries[index];
-  }
-  return null;
-}
-
-function pruneOverlayStateEntries(entries, windows) {
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    const entry = entries[i];
-    let found = false;
-    for (let j = 0; j < windows.length; j += 1) {
-      if (windows[j] === entry.window) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      entries.splice(i, 1);
-    }
-  }
-}
-
-function countOwnProperties(value) {
-  let count = 0;
-  for (const key in value) {
-    if (Object.prototype.hasOwnProperty.call(value, key)) {
-      count += 1;
-    }
-  }
-  return count;
 }
 
 function hasUsableGeometry(window) {
@@ -374,35 +369,9 @@ function isWindowVisible(window) {
   return true;
 }
 
-function isWindowActive(window) {
-  return window && (window.active === true || workspace.activeWindow === window);
-}
-
-function getEventPriority(eventName) {
-  switch (eventName) {
-    case "windowShown":
-    case "activeChanged":
-    case "workspace-windowActivated":
-      return 4;
-    case "windowHidden":
-    case "closed":
-    case "windowAdded":
-    case "windowRemoved":
-    case "windowClassChanged":
-      return 3;
-    case "clientGeometryChanged":
-    case "frameGeometryChanged":
-    case "outputChanged":
-    case "screensChanged":
-      return 2;
-    default:
-      return 1;
-  }
-}
-
 function preferActiveScriptWindow(windows) {
   for (const window of windows) {
-    if (isWindowActive(window)) {
+    if (window && window.active === true) {
       return window;
     }
   }
@@ -440,275 +409,19 @@ function selectTargetMpvWindow() {
     if (matchingHiddenWindows.length > 0) {
       return preferActiveScriptWindow(matchingHiddenWindows);
     }
+
+    return null;
   }
 
-  for (const window of visibleMpvWindows) {
-    if (isWindowActive(window)) {
-      return window;
-    }
+  if (REQUIRE_TARGET_MPV_PID) {
+    return null;
   }
 
   if (visibleMpvWindows.length > 0) {
-    return visibleMpvWindows[0];
+    return preferActiveScriptWindow(visibleMpvWindows);
   }
 
-  for (const window of hiddenMpvWindows) {
-    if (isWindowActive(window)) {
-      return window;
-    }
-  }
-
-  return hiddenMpvWindows[0] || null;
-}
-
-function getOverlayWindows() {
-  const windows = [];
-  for (const window of workspace.windowList()) {
-    if (isTrackableOverlayWindow(window)) {
-      windows.push(window);
-    }
-  }
-  windows.sort(function (left, right) {
-    if (left.modal === true && right.modal !== true) {
-      return 1;
-    }
-    if (left.modal !== true && right.modal === true) {
-      return -1;
-    }
-    return 0;
-  });
-  return windows;
-}
-
-function suppressWindowEvent(window, eventName) {
-  if (!window || !eventName) {
-    return;
-  }
-
-  const entry = ensureOverlayStateEntry(eventSuppressions, window, {});
-  entry.value[eventName] = Number(entry.value[eventName] || 0) + 1;
-}
-
-function shouldIgnoreWindowEvent(window, eventName) {
-  if (!window || !eventName) {
-    return false;
-  }
-
-  const entry = readOverlayStateEntry(eventSuppressions, window);
-  if (!entry || !entry.value) {
-    return false;
-  }
-
-  const currentCount = Number(entry.value[eventName] || 0);
-  if (currentCount <= 0) {
-    return false;
-  }
-
-  entry.value[eventName] = currentCount - 1;
-  if (entry.value[eventName] <= 0) {
-    delete entry.value[eventName];
-  }
-
-  if (countOwnProperties(entry.value) === 0) {
-    removeOverlayStateEntry(eventSuppressions, window);
-  }
-
-  return true;
-}
-
-function releaseSuppressedWindowEvent(window, eventName) {
-  if (!window || !eventName) {
-    return;
-  }
-
-  const entry = readOverlayStateEntry(eventSuppressions, window);
-  if (!entry || !entry.value) {
-    return;
-  }
-
-  const currentCount = Number(entry.value[eventName] || 0);
-  if (currentCount <= 0) {
-    return;
-  }
-
-  entry.value[eventName] = currentCount - 1;
-  if (entry.value[eventName] <= 0) {
-    delete entry.value[eventName];
-  }
-
-  if (countOwnProperties(entry.value) === 0) {
-    removeOverlayStateEntry(eventSuppressions, window);
-  }
-}
-
-function applyWindowMutationWithSuppressedEvents(window, eventNames, mutate) {
-  for (const eventName of eventNames) {
-    suppressWindowEvent(window, eventName);
-  }
-
-  try {
-    mutate();
-  } catch (error) {
-    for (const eventName of eventNames) {
-      releaseSuppressedWindowEvent(window, eventName);
-    }
-    throw error;
-  }
-}
-
-function rememberOverlayKeepAbove(window) {
-  ensureOverlayStateEntry(overlayKeepAboveState, window, window.keepAbove === true);
-}
-
-function restoreOverlayKeepAbove(window) {
-  const entry = readOverlayStateEntry(overlayKeepAboveState, window);
-  if (!entry) {
-    return;
-  }
-  try {
-    window.keepAbove = entry.value === true;
-  } catch (_error) {
-    // ignore
-  }
-  removeOverlayStateEntry(overlayKeepAboveState, window);
-}
-
-function shouldRestoreOverlay(window) {
-  const entry = readOverlayStateEntry(overlayHiddenByScript, window);
-  return entry !== null && entry.value === true;
-}
-
-function markOverlayHiddenByScript(window, hidden) {
-  if (hidden === true) {
-    ensureOverlayStateEntry(overlayHiddenByScript, window, true);
-    return;
-  }
-  removeOverlayStateEntry(overlayHiddenByScript, window);
-}
-
-function setWindowMinimized(window, minimized) {
-  if (!window || window.minimized === (minimized === true)) {
-    return;
-  }
-
-  try {
-    applyWindowMutationWithSuppressedEvents(
-      window,
-      [minimized === true ? "windowHidden" : "windowShown"],
-      function () {
-        window.minimized = minimized === true;
-      }
-    );
-  } catch (_error) {
-    // ignore
-  }
-}
-
-function applyOverlayGeometry(overlayWindow, mpvWindow) {
-  const targetGeometry = getWindowGeometry(mpvWindow);
-  const currentGeometry = overlayWindow.frameGeometry || {};
-  if (
-    Number(currentGeometry.x || 0) === Number(targetGeometry.x || 0) &&
-    Number(currentGeometry.y || 0) === Number(targetGeometry.y || 0) &&
-    Number(currentGeometry.width || 0) === Number(targetGeometry.width || 0) &&
-    Number(currentGeometry.height || 0) === Number(targetGeometry.height || 0)
-  ) {
-    return;
-  }
-
-  try {
-    applyWindowMutationWithSuppressedEvents(
-      overlayWindow,
-      ["frameGeometryChanged"],
-      function () {
-        overlayWindow.frameGeometry = targetGeometry;
-      }
-    );
-  } catch (_error) {
-    // ignore
-  }
-}
-
-function setOverlayKeepAbove(window, enabled) {
-  if (enabled) {
-    rememberOverlayKeepAbove(window);
-    try {
-      window.keepAbove = true;
-    } catch (_error) {
-      // ignore
-    }
-    return;
-  }
-
-  if (readOverlayStateEntry(overlayKeepAboveState, window)) {
-    restoreOverlayKeepAbove(window);
-  }
-}
-
-function restoreVisibleOverlayWindow(window) {
-  if (!shouldRestoreOverlay(window)) {
-    return;
-  }
-
-  setWindowMinimized(window, false);
-  markOverlayHiddenByScript(window, false);
-}
-
-function hideVisibleOverlayWindow(window) {
-  if (!isWindowVisible(window)) {
-    return;
-  }
-
-  setWindowMinimized(window, true);
-  markOverlayHiddenByScript(window, true);
-}
-
-function raiseWindow(window) {
-  if (!window) {
-    return;
-  }
-
-  try {
-    workspace.raiseWindow(window);
-  } catch (_error) {
-    // ignore
-  }
-}
-
-function activateWindow(window) {
-  if (!window || workspace.activeWindow === window) {
-    return;
-  }
-
-  try {
-    applyWindowMutationWithSuppressedEvents(
-      window,
-      ["workspace-windowActivated", "activeChanged"],
-      function () {
-        workspace.activeWindow = window;
-      }
-    );
-  } catch (_error) {
-    // ignore
-  }
-}
-
-function raiseWindowPair(mpvWindow, overlayWindows) {
-  raiseWindow(mpvWindow);
-  activateWindow(mpvWindow);
-
-  let preferredOverlayWindow = null;
-  for (const overlayWindow of overlayWindows) {
-    if (!isWindowVisible(overlayWindow)) {
-      continue;
-    }
-    raiseWindow(overlayWindow);
-    preferredOverlayWindow = overlayWindow;
-  }
-
-  if (preferredOverlayWindow) {
-    activateWindow(preferredOverlayWindow);
-  }
+  return preferActiveScriptWindow(hiddenMpvWindows);
 }
 
 function disableBridge() {
@@ -717,9 +430,6 @@ function disableBridge() {
   }
 
   bridgeDisabled = true;
-  queuedPairSync = false;
-  queuedSyncTriggerWindow = null;
-  queuedSyncTriggerEvent = "";
   if (bridgeDegradedStateEmitted) {
     return;
   }
@@ -741,130 +451,29 @@ function disableBridge() {
   }
 }
 
-function shouldRestoreMpvWindowFromOverlayTrigger(triggerWindow, triggerEvent) {
-  if (!isTrackableOverlayWindow(triggerWindow)) {
-    return false;
-  }
-
-  return (
-    (
-      triggerEvent === "windowShown" ||
-      triggerEvent === "activeChanged" ||
-      triggerEvent === "workspace-windowActivated" ||
-      triggerEvent === "windowAdded"
-    ) &&
-    (isWindowVisible(triggerWindow) || isWindowActive(triggerWindow))
-  );
-}
-
-function shouldRaisePair(triggerWindow, triggerEvent, pairActive) {
-  if (
-    triggerEvent === "clientGeometryChanged" ||
-    triggerEvent === "frameGeometryChanged" ||
-    triggerEvent === "outputChanged" ||
-    triggerEvent === "screensChanged"
-  ) {
-    return false;
-  }
-
-  if (!triggerEvent) {
-    return pairActive;
-  }
-
-  if (
-    triggerEvent !== "windowShown" &&
-    triggerEvent !== "activeChanged" &&
-    triggerEvent !== "workspace-windowActivated" &&
-    triggerEvent !== "windowAdded"
-  ) {
-    return false;
-  }
-
-  return (
-    (isMpvWindow(triggerWindow) || isTrackableOverlayWindow(triggerWindow)) &&
-    (pairActive || isWindowVisible(triggerWindow) || isWindowActive(triggerWindow))
-  );
-}
-
-function syncOverlayPairState(triggerWindow, triggerEvent) {
-  const currentWindows = workspace.windowList();
-  pruneOverlayStateEntries(overlayKeepAboveState, currentWindows);
-  pruneOverlayStateEntries(overlayHiddenByScript, currentWindows);
-  pruneOverlayStateEntries(eventSuppressions, currentWindows);
-
-  const mpvWindow = selectTargetMpvWindow();
-  const overlayWindows = getOverlayWindows();
-
-  if (!mpvWindow) {
-    for (const overlayWindow of overlayWindows) {
-      hideVisibleOverlayWindow(overlayWindow);
-      setOverlayKeepAbove(overlayWindow, false);
-    }
-    return null;
-  }
-
-  if (!isWindowVisible(mpvWindow) && shouldRestoreMpvWindowFromOverlayTrigger(triggerWindow, triggerEvent)) {
-    setWindowMinimized(mpvWindow, false);
-    raiseWindow(mpvWindow);
-    activateWindow(mpvWindow);
-  }
-
-  if (!isWindowVisible(mpvWindow)) {
-    for (const overlayWindow of overlayWindows) {
-      hideVisibleOverlayWindow(overlayWindow);
-      setOverlayKeepAbove(overlayWindow, false);
-    }
-    return null;
-  }
-
-  let pairActive = isWindowActive(mpvWindow);
-  for (const overlayWindow of overlayWindows) {
-    restoreVisibleOverlayWindow(overlayWindow);
-    applyOverlayGeometry(overlayWindow, mpvWindow);
-    if (isWindowActive(overlayWindow)) {
-      pairActive = true;
-    }
-  }
-
-  for (const overlayWindow of overlayWindows) {
-    setOverlayKeepAbove(overlayWindow, pairActive && isWindowVisible(overlayWindow));
-  }
-
-  if (shouldRaisePair(triggerWindow, triggerEvent, pairActive)) {
-    raiseWindowPair(mpvWindow, overlayWindows);
-  }
-
-  return {
-    pairActive: pairActive === true,
-    window: mpvWindow,
-  };
-}
-
-function emitState(state) {
+function emitState() {
   if (bridgeDisabled) {
     return;
   }
 
   try {
-    const selectedWindow = state && state.window ? state.window : null;
-    const selectedWindowPairActive = state && state.pairActive === true;
+    const selectedWindow = selectTargetMpvWindow();
     const windows = [];
     for (const window of workspace.windowList()) {
       if (!isMpvWindow(window)) {
         continue;
       }
-      windows.push(
-        serializeWindow(
-          window,
-          window === selectedWindow ? selectedWindowPairActive : undefined
-        )
-      );
+      windows.push(serializeWindow(window));
     }
+    const selectionBlocked =
+      (selectedWindow && (!isWindowVisible(selectedWindow) || !hasUsableGeometry(selectedWindow)))
+      || (!selectedWindow && REQUIRE_TARGET_MPV_PID);
 
     const payload = JSON.stringify({
+      selectionBlocked: selectionBlocked === true ? true : undefined,
       window:
-        selectedWindow && isWindowVisible(selectedWindow) && hasUsableGeometry(selectedWindow)
-          ? serializeWindow(selectedWindow, selectedWindowPairActive)
+        !selectionBlocked && selectedWindow && isWindowVisible(selectedWindow) && hasUsableGeometry(selectedWindow)
+          ? serializeWindow(selectedWindow)
           : null,
       windows: windows,
     });
@@ -891,100 +500,62 @@ function emitState(state) {
   }
 }
 
-function drainStateSyncQueue() {
-  if (bridgeDisabled || drainingPairSync || !queuedPairSync) {
+function ensureGeometryWatchers(window) {
+  if (geometryWatchedWindows.has(window)) {
     return;
   }
 
-  drainingPairSync = true;
-  let passes = 0;
-  try {
-    while (queuedPairSync && !bridgeDisabled) {
-      passes += 1;
-      if (passes > MAX_SYNC_PASSES_PER_DRAIN) {
-        disableBridge();
-        break;
-      }
-
-      const triggerWindow = queuedSyncTriggerWindow;
-      const triggerEvent = queuedSyncTriggerEvent;
-      queuedPairSync = false;
-      queuedSyncTriggerWindow = null;
-      queuedSyncTriggerEvent = "";
-      emitState(syncOverlayPairState(triggerWindow, triggerEvent));
-    }
-  } catch (_error) {
-    disableBridge();
-  } finally {
-    drainingPairSync = false;
-  }
-}
-
-function queueStateSync(triggerWindow, triggerEvent) {
-  if (bridgeDisabled) {
-    return;
-  }
-
-  if (triggerEvent && shouldIgnoreWindowEvent(triggerWindow, triggerEvent)) {
-    return;
-  }
-
-  if (
-    !queuedPairSync ||
-    getEventPriority(triggerEvent) >= getEventPriority(queuedSyncTriggerEvent)
-  ) {
-    queuedSyncTriggerWindow = triggerWindow || queuedSyncTriggerWindow;
-    queuedSyncTriggerEvent = triggerEvent || queuedSyncTriggerEvent;
-  }
-
-  queuedPairSync = true;
-  drainStateSyncQueue();
-}
-
-function watchWindow(window) {
-  if (bridgeDisabled || !isTrackableWindow(window) || trackedWindows.has(window)) {
-    return;
-  }
-
-  trackedWindows.add(window);
-  if (window.closed) {
-    window.closed.connect(function () {
-      queueStateSync(window, "closed");
-    });
-  }
+  geometryWatchedWindows.add(window);
+  primeGeometryPreference(window);
   if (window.frameGeometryChanged) {
     window.frameGeometryChanged.connect(function () {
-      queueStateSync(window, "frameGeometryChanged");
+      geometryPreference.set(window, "frame");
+      emitState();
     });
   }
   if (window.clientGeometryChanged) {
     window.clientGeometryChanged.connect(function () {
-      queueStateSync(window, "clientGeometryChanged");
+      geometryPreference.set(window, "client");
+      emitState();
     });
   }
   if (window.outputChanged) {
     window.outputChanged.connect(function () {
-      queueStateSync(window, "outputChanged");
+      emitState();
+    });
+  }
+}
+
+function watchWindow(window) {
+  if (bridgeDisabled || !isWatchableWindow(window) || isOverlayWindow(window) || trackedWindows.has(window)) {
+    return;
+  }
+
+  trackedWindows.add(window);
+  if (isMpvWindow(window)) {
+    ensureGeometryWatchers(window);
+  }
+  if (window.closed) {
+    window.closed.connect(function () {
+      emitState();
     });
   }
   if (window.windowClassChanged) {
     window.windowClassChanged.connect(function () {
-      queueStateSync(window, "windowClassChanged");
+      if (isMpvWindow(window)) {
+        ensureGeometryWatchers(window);
+      }
+      emitState();
     });
   }
   if (window.windowShown) {
     window.windowShown.connect(function () {
-      queueStateSync(window, "windowShown");
+      emitState();
     });
   }
   if (window.windowHidden) {
     window.windowHidden.connect(function () {
-      queueStateSync(window, "windowHidden");
-    });
-  }
-  if (window.activeChanged) {
-    window.activeChanged.connect(function () {
-      queueStateSync(window, "activeChanged");
+      emitState();
     });
   }
 }
@@ -997,22 +568,18 @@ function refresh() {
   for (const window of workspace.windowList()) {
     watchWindow(window);
   }
-  queueStateSync(null, "");
+  emitState();
 }
 
 workspace.windowAdded.connect(function (window) {
   watchWindow(window);
-  queueStateSync(window, "windowAdded");
+  emitState();
 });
 workspace.windowRemoved.connect(function () {
-  queueStateSync(null, "windowRemoved");
-});
-workspace.windowActivated.connect(function (window) {
-  watchWindow(window);
-  queueStateSync(window, "workspace-windowActivated");
+  emitState();
 });
 workspace.screensChanged.connect(function () {
-  queueStateSync(null, "screensChanged");
+  emitState();
 });
 
 refresh();
@@ -1029,7 +596,10 @@ export class KWinWindowTracker extends BaseWindowTracker {
   private bus: MessageBus | null = null;
   private scriptId: number | null = null;
   private unloadScriptKey: string | null = null;
-  private readonly commandLineCache = new Map<number, { expiresAt: number; value: string | null }>();
+  private readonly commandLineCache = new Map<
+    number,
+    { expiresAt: number; value: string | null }
+  >();
   private stopped = false;
 
   constructor(targetMpvSocketPath?: string) {
@@ -1039,6 +609,14 @@ export class KWinWindowTracker extends BaseWindowTracker {
     this.serviceName = buildKWinTrackerServiceName(instanceToken);
     this.pluginName = buildKWinTrackerPluginName(instanceToken);
     this.bridgeInterface = new KWinTrackerBridgeInterface((payload) => this.handleUpdate(payload));
+  }
+
+  override hasAuthoritativeFocus(): boolean {
+    return false;
+  }
+
+  override shouldAutoFocusVisibleOverlay(): boolean {
+    return false;
   }
 
   start(): void {
@@ -1057,7 +635,7 @@ export class KWinWindowTracker extends BaseWindowTracker {
       const targetMpvPid = this.resolveTargetMpvPid();
       fs.writeFileSync(
         scriptPath,
-        buildKWinBridgeScript(this.serviceName, targetMpvPid),
+        buildKWinBridgeScript(this.serviceName, targetMpvPid, this.targetMpvSocketPath !== null),
         'utf-8',
       );
       const bus = dbus.sessionBus();
@@ -1143,34 +721,44 @@ export class KWinWindowTracker extends BaseWindowTracker {
       return;
     }
 
-    const windows = Array.isArray(parsed.windows) ? parsed.windows.filter(isKWinWindowCandidate) : [];
+    if (parsed.degraded === true || parsed.selectionBlocked === true) {
+      this.updateGeometry(null);
+      return;
+    }
+
+    const windows = Array.isArray(parsed.windows)
+      ? parsed.windows.filter(isKWinWindowCandidate)
+      : [];
+    const compactWindow = isKWinWindowCandidate(parsed.window) ? parsed.window : null;
     let targetWindow: KWinWindow | null = null;
     if (windows.length > 0) {
       targetWindow = selectKWinMpvWindow(windows, {
         targetMpvSocketPath: this.targetMpvSocketPath,
         getWindowCommandLine: (pid) => this.getWindowCommandLine(pid),
       });
-    } else if (isKWinWindowCandidate(parsed.window)) {
-      targetWindow = parsed.window;
+    }
+
+    if (!targetWindow && !this.targetMpvSocketPath && compactWindow) {
+      targetWindow = compactWindow;
     }
 
     if (
       !targetWindow ||
       targetWindow.normalWindow === false ||
-      targetWindow.minimized === true ||
+      !isVisibleKWinWindow(targetWindow) ||
       !hasValidGeometry(targetWindow)
     ) {
       this.updateGeometry(null);
       return;
     }
 
+    this.updateFocus(targetWindow.active === true);
     this.updateGeometry({
       x: targetWindow.x ?? 0,
       y: targetWindow.y ?? 0,
       width: targetWindow.width ?? 0,
       height: targetWindow.height ?? 0,
     });
-    this.updateFocus(targetWindow.active === true);
   }
 
   private parsePayload(payload: string): KWinUpdatePayload | null {
@@ -1206,7 +794,7 @@ export class KWinWindowTracker extends BaseWindowTracker {
     }
 
     try {
-      const output = execFileSync('ps', ['-eo', 'pid=,args='], {
+      const output = execFileSync('ps', ['-eo', 'pid='], {
         encoding: 'utf-8',
       });
       for (const rawLine of output.split(/\r?\n/)) {
@@ -1215,14 +803,12 @@ export class KWinWindowTracker extends BaseWindowTracker {
           continue;
         }
 
-        const match = line.match(/^(\d+)\s+(.*)$/);
-        if (!match) {
+        const pid = Number.parseInt(line, 10);
+        if (!Number.isInteger(pid) || pid <= 0) {
           continue;
         }
-
-        const pid = Number.parseInt(match[1]!, 10);
-        const commandLine = match[2]!;
-        if (Number.isInteger(pid) && matchesTargetSocket(commandLine, this.targetMpvSocketPath)) {
+        const commandLine = this.readProcessCommandLine(pid);
+        if (commandLine && matchesTargetSocket(commandLine, this.targetMpvSocketPath)) {
           return pid;
         }
       }
@@ -1243,8 +829,7 @@ export class KWinWindowTracker extends BaseWindowTracker {
       try {
         const commandLine = fs
           .readFileSync(`/proc/${safePid}/cmdline`, 'utf-8')
-          .replace(/\0/g, ' ')
-          .trim();
+          .replace(/\0+$/, '');
         return commandLine || null;
       } catch {
         // fall through to ps for environments without /proc access

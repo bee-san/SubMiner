@@ -26,6 +26,7 @@ export abstract class BaseWindowTracker {
   protected currentGeometry: WindowGeometry | null = null;
   protected windowFound: boolean = false;
   protected targetWindowFocused: boolean = false;
+  private pendingInitialFocus: boolean | null = null;
   public onGeometryChange: GeometryChangeCallback | null = null;
   public onWindowFound: WindowFoundCallback | null = null;
   public onWindowLost: WindowLostCallback | null = null;
@@ -58,6 +59,14 @@ export abstract class BaseWindowTracker {
     return this.windowFound;
   }
 
+  hasAuthoritativeFocus(): boolean {
+    return true;
+  }
+
+  shouldAutoFocusVisibleOverlay(): boolean {
+    return true;
+  }
+
   isTargetWindowFocused(): boolean {
     return this.targetWindowFocused;
   }
@@ -72,6 +81,9 @@ export abstract class BaseWindowTracker {
   }
 
   protected updateFocus(focused: boolean): void {
+    if (!this.windowFound) {
+      this.pendingInitialFocus = focused;
+    }
     this.updateTargetWindowFocused(focused);
   }
 
@@ -79,7 +91,9 @@ export abstract class BaseWindowTracker {
     if (newGeometry) {
       if (!this.windowFound) {
         this.windowFound = true;
-        this.updateTargetWindowFocused(true);
+        const initialFocus = this.pendingInitialFocus ?? true;
+        this.pendingInitialFocus = null;
+        this.updateTargetWindowFocused(initialFocus);
         if (this.onWindowFound) this.onWindowFound(newGeometry);
       }
 
@@ -94,6 +108,7 @@ export abstract class BaseWindowTracker {
         if (this.onGeometryChange) this.onGeometryChange(newGeometry);
       }
     } else {
+      this.pendingInitialFocus = null;
       if (this.windowFound) {
         this.windowFound = false;
         this.updateTargetWindowFocused(false);

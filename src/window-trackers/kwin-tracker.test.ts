@@ -53,13 +53,14 @@ interface ScriptWindow {
   resourceName: string;
   keepAbove: boolean;
   visible: boolean;
-  clientGeometry: {
+  hidden?: boolean;
+  clientGeometry?: {
     x: number;
     y: number;
     width: number;
     height: number;
   };
-  frameGeometry: {
+  frameGeometry?: {
     x: number;
     y: number;
     width: number;
@@ -142,6 +143,7 @@ function makeScriptWindow(overrides: Partial<ScriptWindow> = {}): ScriptWindow {
     resourceName: 'mpv',
     keepAbove: false,
     visible: true,
+    hidden: false,
     clientGeometry: {
       x: 10,
       y: 20,
@@ -176,20 +178,17 @@ function makeOverlayScriptWindow(overrides: Partial<ScriptWindow> = {}): ScriptW
   });
 }
 
-interface TrackWindowMutationOptions {
-  emitFrameGeometryChanged?: boolean;
-  emitVisibilitySignals?: boolean;
-}
-
-function trackWindowMutations(
-  window: ScriptWindow,
-  options: TrackWindowMutationOptions = {},
-): ScriptWindow & {
+function trackWindowMutations(window: ScriptWindow): ScriptWindow & {
   frameGeometryAssignments: Array<{ x: number; y: number; width: number; height: number }>;
   minimizedAssignments: boolean[];
   keepAboveAssignments: boolean[];
 } {
-  let frameGeometryValue = { ...window.frameGeometry };
+  let frameGeometryValue = {
+    x: Number(window.frameGeometry?.x || 0),
+    y: Number(window.frameGeometry?.y || 0),
+    width: Number(window.frameGeometry?.width || 0),
+    height: Number(window.frameGeometry?.height || 0),
+  };
   let minimizedValue = window.minimized;
   let keepAboveValue = window.keepAbove;
   const frameGeometryAssignments: Array<{ x: number; y: number; width: number; height: number }> =
@@ -209,9 +208,6 @@ function trackWindowMutations(
         height: Number(value?.height || 0),
       };
       frameGeometryAssignments.push(frameGeometryValue);
-      if (options.emitFrameGeometryChanged) {
-        window.frameGeometryChanged.emit(window);
-      }
     },
   });
 
@@ -222,13 +218,6 @@ function trackWindowMutations(
     set: (value) => {
       minimizedValue = value === true;
       minimizedAssignments.push(minimizedValue);
-      if (options.emitVisibilitySignals) {
-        if (minimizedValue) {
-          window.windowHidden.emit(window);
-        } else {
-          window.windowShown.emit(window);
-        }
-      }
     },
   });
 
@@ -251,6 +240,7 @@ function trackWindowMutations(
 
 function parseLastBridgePayload(payloads: string[]): {
   degraded?: boolean;
+  selectionBlocked?: boolean;
   window?: KWinWindow | null;
   windows?: KWinWindow[];
 } {
@@ -258,6 +248,7 @@ function parseLastBridgePayload(payloads: string[]): {
   assert.notEqual(payload, undefined);
   return JSON.parse(payload! as string) as {
     degraded?: boolean;
+    selectionBlocked?: boolean;
     window?: KWinWindow | null;
     windows?: KWinWindow[];
   };
@@ -265,8 +256,11 @@ function parseLastBridgePayload(payloads: string[]): {
 
 interface RunKWinBridgeScriptOptions {
   emitWorkspaceActivatedOnSet?: boolean;
+  emitPreviousActiveChangedOnSet?: boolean;
+  emitTargetActiveChangedOnSet?: boolean;
   failActiveWindowSetCount?: number;
   targetMpvPid?: number | null;
+  requireTargetMpvPid?: boolean;
 }
 
 function runKWinBridgeScript(
@@ -276,11 +270,13 @@ function runKWinBridgeScript(
   dbusPayloads: string[];
   workspace: ScriptWorkspace;
   activeWindowHistory: string[];
+  activeWindowSetAttempts: string[];
   raiseCalls: string[];
 } {
   const dbusPayloads: string[] = [];
   const raiseCalls: string[] = [];
   const activeWindowHistory: string[] = [];
+  const activeWindowSetAttempts: string[] = [];
   let activeWindow: ScriptWindow | null = null;
   const workspace: ScriptWorkspace = {
     windowList: () => windows,
@@ -298,6 +294,7 @@ function runKWinBridgeScript(
     enumerable: true,
     get: () => activeWindow,
     set: (window: ScriptWindow | null) => {
+      activeWindowSetAttempts.push(window?.testId ?? window?.caption ?? 'null');
       if ((options.failActiveWindowSetCount ?? 0) > 0) {
         options.failActiveWindowSetCount = (options.failActiveWindowSetCount ?? 0) - 1;
         throw new Error('activeWindow set failed');
@@ -305,41 +302,49 @@ function runKWinBridgeScript(
       const previousWindow = activeWindow;
       activeWindow = window;
       activeWindowHistory.push(window?.testId ?? window?.caption ?? 'null');
-      if (
-        options.emitWorkspaceActivatedOnSet &&
-        window &&
-        window !== previousWindow
-      ) {
+      if (options.emitPreviousActiveChangedOnSet && previousWindow && window !== previousWindow) {
+        previousWindow.active = false;
+        previousWindow.activeChanged.emit(previousWindow);
+      }
+      if (options.emitWorkspaceActivatedOnSet && window && window !== previousWindow) {
         workspace.windowActivated.emit(window);
+      }
+      if (options.emitTargetActiveChangedOnSet && window && window !== previousWindow) {
+        window.active = true;
+        window.activeChanged.emit(window);
       }
     },
   });
 
   vm.runInNewContext(
-    buildKWinBridgeScript('io.github.subminer.kwinbridge.test', options.targetMpvPid ?? null),
+    buildKWinBridgeScript(
+      'io.github.subminer.kwinbridge.test',
+      options.targetMpvPid ?? null,
+      options.requireTargetMpvPid === true,
+    ),
     {
-    Array,
-    GuardedWeakSet,
-    JSON,
-    Number,
-    Object,
-    String,
-    WeakSet: GuardedWeakSet,
-    callDBus: (
-      _serviceName: string,
-      _objectPath: string,
-      _interfaceName: string,
-      member: string,
-      payload: string,
-    ) => {
-      assert.equal(member, 'Update');
-      dbusPayloads.push(payload);
-    },
-    workspace,
+      Array,
+      GuardedWeakSet,
+      JSON,
+      Number,
+      Object,
+      String,
+      WeakSet: GuardedWeakSet,
+      callDBus: (
+        _serviceName: string,
+        _objectPath: string,
+        _interfaceName: string,
+        member: string,
+        payload: string,
+      ) => {
+        assert.equal(member, 'Update');
+        dbusPayloads.push(payload);
+      },
+      workspace,
     },
   );
 
-  return { dbusPayloads, workspace, activeWindowHistory, raiseCalls };
+  return { dbusPayloads, workspace, activeWindowHistory, activeWindowSetAttempts, raiseCalls };
 }
 
 function withPlatform<T>(platform: NodeJS.Platform, callback: () => T): T {
@@ -390,10 +395,7 @@ test('selectKWinMpvWindow prefers the active window among socket matches', () =>
   ]);
 
   const selected = selectKWinMpvWindow(
-    [
-      makeWindow({ pid: 10, active: false }),
-      makeWindow({ pid: 20, active: true }),
-    ],
+    [makeWindow({ pid: 10, active: false }), makeWindow({ pid: 20, active: true })],
     {
       targetMpvSocketPath: '/tmp/subminer.sock',
       getWindowCommandLine: (pid) => commandLines.get(pid) ?? null,
@@ -405,10 +407,7 @@ test('selectKWinMpvWindow prefers the active window among socket matches', () =>
 
 test('selectKWinMpvWindow requires an exact socket-path match', () => {
   const selected = selectKWinMpvWindow(
-    [
-      makeWindow({ pid: 10, active: true }),
-      makeWindow({ pid: 20, active: false }),
-    ],
+    [makeWindow({ pid: 10, active: true }), makeWindow({ pid: 20, active: false })],
     {
       targetMpvSocketPath: '/tmp/subminer.sock',
       getWindowCommandLine: (pid) => {
@@ -422,14 +421,11 @@ test('selectKWinMpvWindow requires an exact socket-path match', () => {
   assert.equal(selected?.pid, 20);
 });
 
-test('selectKWinMpvWindow matches quoted socket paths exactly', () => {
-  const selected = selectKWinMpvWindow(
-    [makeWindow({ pid: 10, active: true })],
-    {
-      targetMpvSocketPath: '/tmp/subminer socket.sock',
-      getWindowCommandLine: () => 'mpv --input-ipc-server="/tmp/subminer socket.sock" first.mkv',
-    },
-  );
+test('selectKWinMpvWindow matches Linux /proc-style socket paths with spaces', () => {
+  const selected = selectKWinMpvWindow([makeWindow({ pid: 10, active: true })], {
+    targetMpvSocketPath: '/tmp/subminer socket.sock',
+    getWindowCommandLine: () => 'mpv\0--input-ipc-server=/tmp/subminer socket.sock\0first.mkv\0',
+  });
 
   assert.equal(selected?.pid, 10);
 });
@@ -438,7 +434,12 @@ test('selectKWinMpvWindow ignores minimized and non-mpv windows', () => {
   const selected = selectKWinMpvWindow(
     [
       makeWindow({ minimized: true, pid: 1 }),
-      makeWindow({ resourceClass: 'vlc', resourceName: 'vlc', caption: 'VLC media player', pid: 2 }),
+      makeWindow({
+        resourceClass: 'vlc',
+        resourceName: 'vlc',
+        caption: 'VLC media player',
+        pid: 2,
+      }),
       makeWindow({ pid: 3, x: 100, y: 200, width: 1920, height: 1080 }),
     ],
     {
@@ -448,6 +449,21 @@ test('selectKWinMpvWindow ignores minimized and non-mpv windows', () => {
   );
 
   assert.equal(selected?.pid, 3);
+});
+
+test('selectKWinMpvWindow ignores hidden serialized windows', () => {
+  const selected = selectKWinMpvWindow(
+    [
+      makeWindow({ active: true, hidden: true, pid: 1, visible: false }),
+      makeWindow({ active: false, pid: 2 }),
+    ],
+    {
+      targetMpvSocketPath: null,
+      getWindowCommandLine: () => null,
+    },
+  );
+
+  assert.equal(selected?.pid, 2);
 });
 
 test('detectCompositor resolves kwin on KDE Plasma Wayland', () => {
@@ -487,14 +503,8 @@ test('detectCompositor resolves sway when SWAYSOCK is present', () => {
 });
 
 test('KWin tracker names are instance-scoped', () => {
-  assert.equal(
-    buildKWinTrackerServiceName('p123_abc'),
-    'io.github.subminer.kwinbridge.p123_abc',
-  );
-  assert.equal(
-    buildKWinTrackerPluginName('p123_abc'),
-    'subminerKWinTracker_p123_abc',
-  );
+  assert.equal(buildKWinTrackerServiceName('p123_abc'), 'io.github.subminer.kwinbridge.p123_abc');
+  assert.equal(buildKWinTrackerPluginName('p123_abc'), 'subminerKWinTracker_p123_abc');
 });
 
 test('KWin bridge script skips unsafe windows before WeakSet access', () => {
@@ -548,10 +558,10 @@ test('KWin bridge script skips unsafe windows before WeakSet access', () => {
     outlineWindow,
   ]);
 
-  assert.equal(workspace.windowActivated.callbacks.length > 0, true);
+  assert.equal(workspace.windowActivated.callbacks.length, 0);
   assert.equal(safeMpvWindow.closed.callbacks.length > 0, true);
-  assert.equal(overlayWindow.closed.callbacks.length > 0, true);
-  assert.equal(safeCandidateWindow.windowClassChanged.callbacks.length, 0);
+  assert.equal(overlayWindow.closed.callbacks.length, 0);
+  assert.equal(safeCandidateWindow.windowClassChanged.callbacks.length > 0, true);
   assert.equal(deletedWindow.closed.callbacks.length, 0);
   assert.equal(transientWindow.closed.callbacks.length, 0);
   assert.equal(unmanagedWindow.closed.callbacks.length, 0);
@@ -569,19 +579,55 @@ test('KWin bridge script skips unsafe windows before WeakSet access', () => {
   assert.equal(popupWindow.closed.callbacks.length, 0);
 });
 
-test('KWin bridge script watches mpv windows for active changes', () => {
-  const mpvWindow = makeScriptWindow({ active: false, testId: 'mpv-window' });
-  const { dbusPayloads } = runKWinBridgeScript([mpvWindow]);
+test('KWin bridge script tracks windows that become mpv after being added', () => {
+  const overlayWindow = makeOverlayScriptWindow({
+    testId: 'overlay-window',
+  });
+  const windows: ScriptWindow[] = [overlayWindow];
+  const { dbusPayloads, workspace } = runKWinBridgeScript(windows);
+  const candidateWindow = makeScriptWindow({
+    caption: 'Konsole',
+    pid: 222,
+    resourceClass: 'konsole',
+    resourceName: 'konsole',
+    testId: 'candidate-window',
+  });
 
-  assert.equal(parseLastBridgePayload(dbusPayloads).window?.active, false);
+  windows.unshift(candidateWindow);
+  workspace.windowAdded.emit(candidateWindow);
 
-  mpvWindow.active = true;
-  mpvWindow.activeChanged.emit(mpvWindow);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window, null);
+  assert.equal(candidateWindow.clientGeometryChanged.callbacks.length, 0);
 
-  assert.equal(parseLastBridgePayload(dbusPayloads).window?.active, true);
+  candidateWindow.caption = 'mpv';
+  candidateWindow.resourceClass = 'mpv';
+  candidateWindow.resourceName = 'mpv';
+  candidateWindow.windowClassChanged.emit(candidateWindow);
+
+  assert.equal(candidateWindow.clientGeometryChanged.callbacks.length > 0, true);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window?.pid, 222);
 });
 
-test('KWin bridge script uses client geometry for overlay placement', () => {
+test('KWin bridge script ignores overlay activation and reports only mpv windows', () => {
+  const mpvWindow = makeScriptWindow({ active: false, testId: 'mpv-window' });
+  const overlayWindow = makeOverlayScriptWindow({
+    active: true,
+    testId: 'overlay-window',
+  });
+  const { dbusPayloads, workspace } = runKWinBridgeScript([mpvWindow, overlayWindow]);
+
+  const payload = parseLastBridgePayload(dbusPayloads);
+  assert.equal(workspace.windowActivated.callbacks.length, 0);
+  assert.equal(mpvWindow.activeChanged.callbacks.length, 0);
+  assert.equal(overlayWindow.activeChanged.callbacks.length, 0);
+  assert.equal(payload.window?.active, false);
+  assert.deepEqual(
+    payload.windows?.map((window) => window.caption),
+    ['mpv'],
+  );
+});
+
+test('KWin bridge script uses client geometry without mutating overlay windows', () => {
   const mpvWindow = makeScriptWindow({
     testId: 'mpv-window',
     clientGeometry: {
@@ -611,12 +657,9 @@ test('KWin bridge script uses client geometry for overlay placement', () => {
   const { dbusPayloads } = runKWinBridgeScript([mpvWindow, overlayWindow]);
 
   assert.equal(mpvWindow.clientGeometryChanged.callbacks.length > 0, true);
-  assert.deepEqual(overlayWindow.frameGeometryAssignments.at(-1), {
-    x: 40,
-    y: 60,
-    width: 1280,
-    height: 720,
-  });
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
+  assert.equal(overlayWindow.minimizedAssignments.length, 0);
+  assert.equal(overlayWindow.keepAboveAssignments.length, 0);
   assert.deepEqual(parseLastBridgePayload(dbusPayloads).window, {
     active: false,
     caption: 'mpv',
@@ -639,12 +682,7 @@ test('KWin bridge script uses client geometry for overlay placement', () => {
   };
   mpvWindow.clientGeometryChanged.emit(mpvWindow);
 
-  assert.deepEqual(overlayWindow.frameGeometryAssignments.at(-1), {
-    x: 55,
-    y: 75,
-    width: 1200,
-    height: 680,
-  });
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
   assert.deepEqual(parseLastBridgePayload(dbusPayloads).window, {
     active: false,
     caption: 'mpv',
@@ -658,6 +696,85 @@ test('KWin bridge script uses client geometry for overlay placement', () => {
     width: 1200,
     height: 680,
   });
+});
+
+test('KWin bridge script follows mpv moves when KWin signals frame geometry changes', () => {
+  const mpvWindow = makeScriptWindow({
+    clientGeometry: {
+      x: 40,
+      y: 60,
+      width: 1280,
+      height: 720,
+    },
+    testId: 'mpv-window',
+    frameGeometry: {
+      x: 12,
+      y: 24,
+      width: 1360,
+      height: 816,
+    },
+  });
+  const overlayWindow = trackWindowMutations(
+    makeOverlayScriptWindow({
+      testId: 'overlay-window',
+      frameGeometry: {
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      },
+    }),
+  );
+  const { dbusPayloads } = runKWinBridgeScript([mpvWindow, overlayWindow]);
+
+  mpvWindow.frameGeometry = {
+    x: 85,
+    y: 105,
+    width: 1180,
+    height: 660,
+  };
+  mpvWindow.frameGeometryChanged.emit(mpvWindow);
+
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
+  assert.equal(parseLastBridgePayload(dbusPayloads).degraded, undefined);
+  assert.deepEqual(parseLastBridgePayload(dbusPayloads).window, {
+    active: false,
+    caption: 'mpv',
+    minimized: false,
+    normalWindow: true,
+    pid: 100,
+    resourceClass: 'mpv',
+    resourceName: 'mpv',
+    x: 85,
+    y: 105,
+    width: 1180,
+    height: 660,
+  });
+});
+
+test('KWin bridge script stays read-only during startup sync', () => {
+  const mpvWindow = makeScriptWindow({
+    active: true,
+    testId: 'mpv-window',
+  });
+  const overlayWindow = trackWindowMutations(
+    makeOverlayScriptWindow({
+      testId: 'overlay-window',
+    }),
+  );
+
+  const { activeWindowSetAttempts, dbusPayloads, raiseCalls } = runKWinBridgeScript([
+    mpvWindow,
+    overlayWindow,
+  ]);
+
+  assert.deepEqual(raiseCalls, []);
+  assert.deepEqual(activeWindowSetAttempts, []);
+  assert.equal(parseLastBridgePayload(dbusPayloads).degraded, undefined);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window?.active, true);
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
+  assert.equal(overlayWindow.minimizedAssignments.length, 0);
+  assert.equal(overlayWindow.keepAboveAssignments.length, 0);
 });
 
 test('KWin bridge script prefers the configured target mpv pid over another active mpv window', () => {
@@ -686,33 +803,29 @@ test('KWin bridge script prefers the configured target mpv pid over another acti
   const overlayWindow = trackWindowMutations(
     makeOverlayScriptWindow({
       testId: 'overlay-window',
-      frameGeometry: {
-        x: 0,
-        y: 0,
-        width: 10,
-        height: 10,
-      },
     }),
   );
 
   const { dbusPayloads } = runKWinBridgeScript(
     [activeOtherMpvWindow, targetMpvWindow, overlayWindow],
-    { targetMpvPid: 202 },
+    { requireTargetMpvPid: true, targetMpvPid: 202 },
   );
 
-  assert.deepEqual(overlayWindow.frameGeometryAssignments.at(-1), {
-    x: 40,
-    y: 60,
-    width: 1280,
-    height: 720,
-  });
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
   assert.equal(parseLastBridgePayload(dbusPayloads).window?.pid, 202);
 });
 
-test('KWin bridge script raises the mpv and overlay pair together when mpv is active', () => {
-  const mpvWindow = makeScriptWindow({
+test('KWin bridge script fails closed when the configured target mpv pid is absent', () => {
+  const activeOtherMpvWindow = makeScriptWindow({
     active: true,
-    testId: 'mpv-window',
+    pid: 101,
+    testId: 'other-mpv-window',
+    clientGeometry: {
+      x: 10,
+      y: 20,
+      width: 640,
+      height: 360,
+    },
   });
   const overlayWindow = trackWindowMutations(
     makeOverlayScriptWindow({
@@ -720,30 +833,45 @@ test('KWin bridge script raises the mpv and overlay pair together when mpv is ac
     }),
   );
 
-  const { activeWindowHistory, raiseCalls } = runKWinBridgeScript([mpvWindow, overlayWindow]);
+  const { dbusPayloads } = runKWinBridgeScript([activeOtherMpvWindow, overlayWindow], {
+    requireTargetMpvPid: true,
+    targetMpvPid: 202,
+  });
 
-  assert.deepEqual(raiseCalls, ['mpv-window', 'overlay-window']);
-  assert.deepEqual(activeWindowHistory, ['mpv-window', 'overlay-window']);
-  assert.deepEqual(overlayWindow.keepAboveAssignments, [true]);
+  assert.equal(parseLastBridgePayload(dbusPayloads).selectionBlocked, true);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window, null);
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
 });
 
-test('KWin bridge script reports pair focus when the overlay is active', () => {
-  const mpvWindow = makeScriptWindow({
-    active: false,
-    testId: 'mpv-window',
-  });
-  const overlayWindow = makeOverlayScriptWindow({
+test('KWin bridge script fails closed when socket targeting is required but no target pid was resolved', () => {
+  const activeOtherMpvWindow = makeScriptWindow({
     active: true,
-    testId: 'overlay-window',
+    pid: 101,
+    testId: 'other-mpv-window',
+    clientGeometry: {
+      x: 10,
+      y: 20,
+      width: 640,
+      height: 360,
+    },
+  });
+  const overlayWindow = trackWindowMutations(
+    makeOverlayScriptWindow({
+      testId: 'overlay-window',
+    }),
+  );
+
+  const { dbusPayloads } = runKWinBridgeScript([activeOtherMpvWindow, overlayWindow], {
+    requireTargetMpvPid: true,
+    targetMpvPid: null,
   });
 
-  const { dbusPayloads } = runKWinBridgeScript([mpvWindow, overlayWindow]);
-
-  assert.equal(parseLastBridgePayload(dbusPayloads).window?.active, true);
-  assert.equal(parseLastBridgePayload(dbusPayloads).windows?.find((window) => window.pid === 100)?.active, true);
+  assert.equal(parseLastBridgePayload(dbusPayloads).selectionBlocked, true);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window, null);
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
 });
 
-test('KWin bridge script hides overlay windows when mpv is minimized and restores only script-hidden overlays', () => {
+test('KWin bridge script does not mutate overlay windows when mpv visibility changes', () => {
   const mpvWindow = trackWindowMutations(
     makeScriptWindow({
       active: true,
@@ -755,145 +883,42 @@ test('KWin bridge script hides overlay windows when mpv is minimized and restore
       testId: 'overlay-window',
     }),
   );
-  const manuallyHiddenOverlayWindow = trackWindowMutations(
-    makeOverlayScriptWindow({
-      minimized: true,
-      testId: 'manual-overlay-window',
-    }),
-  );
-
-  runKWinBridgeScript([mpvWindow, overlayWindow, manuallyHiddenOverlayWindow]);
-
-  mpvWindow.minimized = true;
-  mpvWindow.windowHidden.emit(mpvWindow);
-  assert.equal(overlayWindow.minimizedAssignments.includes(true), true);
-
-  mpvWindow.minimized = false;
-  mpvWindow.windowShown.emit(mpvWindow);
-
-  assert.equal(overlayWindow.minimizedAssignments.at(-1), false);
-  assert.equal(manuallyHiddenOverlayWindow.minimizedAssignments.includes(false), false);
-});
-
-test('KWin bridge script restores mpv when the overlay is shown while mpv is minimized', () => {
-  const mpvWindow = trackWindowMutations(
-    makeScriptWindow({
-      minimized: true,
-      testId: 'mpv-window',
-    }),
-  );
-  const overlayWindow = trackWindowMutations(
-    makeOverlayScriptWindow({
-      minimized: true,
-      testId: 'overlay-window',
-    }),
-  );
-
-  const { activeWindowHistory, raiseCalls } = runKWinBridgeScript([mpvWindow, overlayWindow]);
-
-  overlayWindow.minimized = false;
-  overlayWindow.windowShown.emit(overlayWindow);
-
-  assert.equal(mpvWindow.minimizedAssignments.includes(false), true);
-  assert.equal(raiseCalls.at(-2), 'mpv-window');
-  assert.equal(raiseCalls.at(-1), 'overlay-window');
-  assert.equal(activeWindowHistory.at(-2), 'mpv-window');
-  assert.equal(activeWindowHistory.at(-1), 'overlay-window');
-});
-
-test('KWin bridge script restores overlay keep-above state after the pair loses activation', () => {
-  const mpvWindow = makeScriptWindow({
-    active: true,
-    testId: 'mpv-window',
-  });
-  const overlayWindow = trackWindowMutations(
-    makeOverlayScriptWindow({
-      testId: 'overlay-window',
-    }),
-  );
-  const otherWindow = makeScriptWindow({
-    active: true,
-    caption: 'Terminal',
-    resourceClass: 'konsole',
-    resourceName: 'konsole',
-    testId: 'other-window',
-  });
-
-  const { workspace } = runKWinBridgeScript([mpvWindow, overlayWindow, otherWindow]);
-
-  mpvWindow.active = false;
-  overlayWindow.active = false;
-  workspace.activeWindow = otherWindow;
-  workspace.windowActivated.emit(otherWindow);
-
-  assert.equal(overlayWindow.keepAboveAssignments.at(-1), false);
-});
-
-test('KWin bridge script suppresses script-caused overlay geometry events', () => {
-  const mpvWindow = makeScriptWindow({
-    testId: 'mpv-window',
-  });
-  const overlayWindow = trackWindowMutations(
-    makeOverlayScriptWindow({
-      testId: 'overlay-window',
-      frameGeometry: {
-        x: 0,
-        y: 0,
-        width: 10,
-        height: 10,
-      },
-    }),
-    { emitFrameGeometryChanged: true },
-  );
 
   const { dbusPayloads } = runKWinBridgeScript([mpvWindow, overlayWindow]);
 
-  assert.equal(overlayWindow.frameGeometryAssignments.length, 1);
-  assert.equal(dbusPayloads.length, 1);
-  assert.equal(parseLastBridgePayload(dbusPayloads).degraded, undefined);
+  mpvWindow.minimized = true;
+  mpvWindow.windowHidden.emit(mpvWindow);
+
+  assert.equal(parseLastBridgePayload(dbusPayloads).selectionBlocked, true);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window, null);
+  assert.equal(overlayWindow.frameGeometryAssignments.length, 0);
+  assert.equal(overlayWindow.minimizedAssignments.length, 0);
+  assert.equal(overlayWindow.keepAboveAssignments.length, 0);
 });
 
-test('KWin bridge script suppresses script-caused activation loops', () => {
-  const mpvWindow = makeScriptWindow({
-    active: true,
-    testId: 'mpv-window',
-  });
+test('KWin bridge script does not write workspace.activeWindow when an mpv window is added later', () => {
   const overlayWindow = trackWindowMutations(
     makeOverlayScriptWindow({
       testId: 'overlay-window',
     }),
   );
+  const windows: ScriptWindow[] = [overlayWindow];
 
-  const { activeWindowHistory, dbusPayloads, raiseCalls } = runKWinBridgeScript(
-    [mpvWindow, overlayWindow],
-    { emitWorkspaceActivatedOnSet: true },
-  );
-
-  assert.deepEqual(raiseCalls, ['mpv-window', 'overlay-window']);
-  assert.deepEqual(activeWindowHistory, ['mpv-window', 'overlay-window']);
-  assert.equal(dbusPayloads.length, 1);
-  assert.equal(parseLastBridgePayload(dbusPayloads).degraded, undefined);
-});
-
-test('KWin bridge script rolls back activation suppression when scripted activation fails', () => {
-  const mpvWindow = makeScriptWindow({
-    active: true,
-    testId: 'mpv-window',
-  });
-  const overlayWindow = trackWindowMutations(
-    makeOverlayScriptWindow({
-      testId: 'overlay-window',
-    }),
-  );
-
-  const { raiseCalls } = runKWinBridgeScript([mpvWindow, overlayWindow], {
-    failActiveWindowSetCount: 1,
-  });
+  const { activeWindowSetAttempts, dbusPayloads, raiseCalls, workspace } =
+    runKWinBridgeScript(windows);
   const initialRaiseCallCount = raiseCalls.length;
 
-  mpvWindow.activeChanged.emit(mpvWindow);
+  const mpvWindow = makeScriptWindow({
+    active: true,
+    testId: 'mpv-window',
+  });
+  windows.unshift(mpvWindow);
+  workspace.windowAdded.emit(mpvWindow);
 
-  assert.deepEqual(raiseCalls.slice(initialRaiseCallCount), ['mpv-window', 'overlay-window']);
+  assert.deepEqual(raiseCalls.slice(initialRaiseCallCount), []);
+  assert.deepEqual(activeWindowSetAttempts, []);
+  assert.equal(parseLastBridgePayload(dbusPayloads).degraded, undefined);
+  assert.equal(parseLastBridgePayload(dbusPayloads).window?.pid, 100);
 });
 
 test('KWin bridge script skips redundant DBus updates when overlay-only churn does not change mpv state', () => {
@@ -907,6 +932,7 @@ test('KWin bridge script skips redundant DBus updates when overlay-only churn do
   const { dbusPayloads } = runKWinBridgeScript([mpvWindow, overlayWindow]);
   const initialPayloadCount = dbusPayloads.length;
 
+  assert.equal(overlayWindow.frameGeometryChanged.callbacks.length, 0);
   overlayWindow.frameGeometryChanged.emit(overlayWindow);
 
   assert.equal(dbusPayloads.length, initialPayloadCount);
@@ -926,9 +952,17 @@ test('KWin bridge script degrades safely when a payload would exceed the size li
     window: null,
   });
 
-  mpvWindow.active = true;
-  mpvWindow.activeChanged.emit(mpvWindow);
+  mpvWindow.clientGeometryChanged.emit(mpvWindow);
   assert.equal(dbusPayloads.length, 1);
+});
+
+test('KWin tracker exposes passive focus capabilities', async () => {
+  const tracker = new KWinWindowTracker();
+
+  assert.equal(tracker.hasAuthoritativeFocus(), false);
+  assert.equal(tracker.shouldAutoFocusVisibleOverlay(), false);
+
+  await (tracker as any).stopAsync();
 });
 
 test('KWin tracker falls back to unloading unnamed loadScript calls by file path', async () => {
@@ -1018,10 +1052,7 @@ test('KWin tracker stop unloads the tracked fallback script key', async () => {
 
   await tracker.stopAsync();
 
-  assert.deepEqual(calls.slice(0, 2), [
-    'stop:23',
-    'unload:/tmp/subminer-kwin-test/main.js',
-  ]);
+  assert.deepEqual(calls.slice(0, 2), ['stop:23', 'unload:/tmp/subminer-kwin-test/main.js']);
 });
 
 test('KWin tracker recreates its temp workspace after stop', async () => {
@@ -1055,15 +1086,6 @@ test('KWin tracker ignores malformed windows payloads', async () => {
 
 test('KWin tracker filters malformed window entries before selection', async () => {
   const tracker = new KWinWindowTracker() as any;
-  const geometries: unknown[] = [];
-  const focusStates: boolean[] = [];
-
-  tracker.updateGeometry = (geometry: unknown) => {
-    geometries.push(geometry);
-  };
-  tracker.updateFocus = (focused: boolean) => {
-    focusStates.push(focused);
-  };
   tracker.getWindowCommandLine = () => null;
 
   tracker.handleUpdate(
@@ -1072,22 +1094,31 @@ test('KWin tracker filters malformed window entries before selection', async () 
     }),
   );
 
-  assert.deepEqual(geometries, [{ x: 50, y: 60, width: 1280, height: 720 }]);
-  assert.deepEqual(focusStates, [true]);
+  assert.deepEqual(tracker.getGeometry(), { x: 50, y: 60, width: 1280, height: 720 });
+  assert.equal(tracker.isTargetWindowFocused(), true);
+  await tracker.stopAsync();
+});
+
+test('KWin tracker reports an initially inactive window as unfocused without a transient focused=true transition', async () => {
+  const tracker = new KWinWindowTracker() as any;
+  const focusTransitions: boolean[] = [];
+
+  tracker.onWindowFocusChange = (focused: boolean) => {
+    focusTransitions.push(focused);
+  };
+
+  tracker.handleUpdate(
+    JSON.stringify({
+      window: makeWindow({ active: false, pid: 9, x: 50, y: 60 }),
+    }),
+  );
+
+  assert.deepEqual(focusTransitions, []);
   await tracker.stopAsync();
 });
 
 test('KWin tracker consumes compact single-window payloads', async () => {
   const tracker = new KWinWindowTracker() as any;
-  const geometries: unknown[] = [];
-  const focusStates: boolean[] = [];
-
-  tracker.updateGeometry = (geometry: unknown) => {
-    geometries.push(geometry);
-  };
-  tracker.updateFocus = (focused: boolean) => {
-    focusStates.push(focused);
-  };
 
   tracker.handleUpdate(
     JSON.stringify({
@@ -1095,22 +1126,13 @@ test('KWin tracker consumes compact single-window payloads', async () => {
     }),
   );
 
-  assert.deepEqual(geometries, [{ x: 50, y: 60, width: 1280, height: 720 }]);
-  assert.deepEqual(focusStates, [true]);
+  assert.deepEqual(tracker.getGeometry(), { x: 50, y: 60, width: 1280, height: 720 });
+  assert.equal(tracker.isTargetWindowFocused(), true);
   await tracker.stopAsync();
 });
 
 test('KWin tracker prefers windows payload selection when socket filtering is available', async () => {
   const tracker = new KWinWindowTracker('/tmp/subminer.sock') as any;
-  const geometries: unknown[] = [];
-  const focusStates: boolean[] = [];
-
-  tracker.updateGeometry = (geometry: unknown) => {
-    geometries.push(geometry);
-  };
-  tracker.updateFocus = (focused: boolean) => {
-    focusStates.push(focused);
-  };
   tracker.getWindowCommandLine = (pid: number) => {
     if (pid === 10) {
       return 'mpv --input-ipc-server=/tmp/other.sock first.mkv';
@@ -1131,8 +1153,62 @@ test('KWin tracker prefers windows payload selection when socket filtering is av
     }),
   );
 
-  assert.deepEqual(geometries, [{ x: 50, y: 60, width: 1280, height: 720 }]);
-  assert.deepEqual(focusStates, [false]);
+  assert.deepEqual(tracker.getGeometry(), { x: 50, y: 60, width: 1280, height: 720 });
+  assert.equal(tracker.isTargetWindowFocused(), false);
+  await tracker.stopAsync();
+});
+
+test('KWin tracker fails closed when socket filtering cannot resolve a match', async () => {
+  const tracker = new KWinWindowTracker('/tmp/subminer.sock') as any;
+  const geometries: unknown[] = [];
+  const focusStates: boolean[] = [];
+
+  tracker.updateGeometry = (geometry: unknown) => {
+    geometries.push(geometry);
+  };
+  tracker.updateFocus = (focused: boolean) => {
+    focusStates.push(focused);
+  };
+  tracker.getWindowCommandLine = () => null;
+
+  tracker.handleUpdate(
+    JSON.stringify({
+      window: makeWindow({ active: true, pid: 10, x: 10, y: 20 }),
+      windows: [
+        makeWindow({ active: true, pid: 10, x: 10, y: 20 }),
+        makeWindow({ active: false, pid: 20, x: 50, y: 60 }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(geometries, [null]);
+  assert.deepEqual(focusStates, []);
+  await tracker.stopAsync();
+});
+
+test('KWin tracker clears geometry when the bridge blocks target selection', async () => {
+  const tracker = new KWinWindowTracker('/tmp/subminer.sock') as any;
+  const geometries: unknown[] = [];
+  const focusStates: boolean[] = [];
+
+  tracker.updateGeometry = (geometry: unknown) => {
+    geometries.push(geometry);
+  };
+  tracker.updateFocus = (focused: boolean) => {
+    focusStates.push(focused);
+  };
+  tracker.getWindowCommandLine = () => 'mpv --input-ipc-server=/tmp/subminer.sock';
+
+  tracker.handleUpdate(
+    JSON.stringify({
+      selectionBlocked: true,
+      window: null,
+      windows: [makeWindow({ hidden: true, pid: 20, visible: false, x: 50, y: 60 })],
+    }),
+  );
+
+  assert.deepEqual(geometries, [null]);
+  assert.deepEqual(focusStates, []);
   await tracker.stopAsync();
 });
 

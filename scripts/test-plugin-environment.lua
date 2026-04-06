@@ -65,4 +65,12 @@ local backend = detect_backend({
 
 assert_equals("kwin", backend, "expected KDE Plasma Wayland to resolve to the kwin backend")
 
+local unsupported_backend = detect_backend({
+	platform = "linux",
+	WAYLAND_DISPLAY = "wayland-0",
+	XDG_SESSION_TYPE = "wayland",
+})
+
+assert_equals(nil, unsupported_backend, "expected unsupported Wayland sessions to stay unresolved")
+
 print("plugin environment backend detection tests: OK")

@@ -37,6 +37,8 @@ export function updateVisibleOverlayVisibility(args: {
 
   const showPassiveVisibleOverlay = (): void => {
     const forceMousePassthrough = args.forceMousePassthrough === true;
+    const shouldAutoFocusVisibleOverlay =
+      args.windowTracker?.shouldAutoFocusVisibleOverlay?.() ?? true;
     if (args.isMacOSPlatform || args.isWindowsPlatform || forceMousePassthrough) {
       mainWindow.setIgnoreMouseEvents(true, { forward: true });
     } else {
@@ -44,7 +46,12 @@ export function updateVisibleOverlayVisibility(args: {
     }
     args.ensureOverlayWindowLevel(mainWindow);
     mainWindow.show();
-    if (!args.isWindowsPlatform && !args.isMacOSPlatform && !forceMousePassthrough) {
+    if (
+      !args.isWindowsPlatform &&
+      !args.isMacOSPlatform &&
+      !forceMousePassthrough &&
+      shouldAutoFocusVisibleOverlay
+    ) {
       mainWindow.focus();
     }
   };

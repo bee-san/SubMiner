@@ -289,7 +289,7 @@ The Jimaku API has rate limits. If you see 429 errors, wait for the retry durati
 
 ### Linux
 
-- **Wayland (KDE Plasma)**: Native KWin window tracking keeps the overlay paired with mpv on Plasma Wayland, so moving, minimizing, restoring, or re-focusing either window should bring the pair along together.
+- **Wayland (KDE Plasma)**: Native KWin window tracking passively follows the tracked mpv window geometry and visibility on Plasma Wayland. It does not try to minimize, restore, raise, or focus mpv and overlay windows as a coupled pair.
 - **Wayland (Hyprland/Sway)**: Window tracking uses compositor-specific commands. If `hyprctl` or `swaymsg` are not on `PATH`, tracking will fail silently.
 - **X11**: Requires `xdotool` and `xwininfo`. If missing, the overlay cannot track the mpv window position.
 - **Mouse passthrough**: On Linux, Electron's mouse passthrough is still unreliable. Even on Plasma Wayland with the native KWin backend, SubMiner keeps pointer events enabled, so you may need to toggle the overlay off to interact with mpv controls underneath. If you want to try the XWayland path instead, launch with `subminer --backend x11`.

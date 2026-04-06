@@ -10,28 +10,46 @@ export function isGlobalShortcutRegisteredSafe(accelerator: string): boolean {
   }
 }
 
-function matchesAcceleratorKeyToken(input: Electron.Input, keyToken: string): boolean {
+function matchesAcceleratorKeyToken(
+  input: Electron.Input,
+  keyToken: string,
+): { matched: boolean; implicitShift: boolean } {
   const inputCode = typeof input.code === 'string' ? input.code.toLowerCase() : '';
   const inputKey = typeof input.key === 'string' ? input.key.toLowerCase() : '';
 
   if (keyToken.length === 1) {
     if (/^[a-z]$/.test(keyToken)) {
-      return inputCode === `key${keyToken}` || inputKey === keyToken;
+      return {
+        matched: inputCode === `key${keyToken}` || inputKey === keyToken,
+        implicitShift: false,
+      };
     }
     if (/^[0-9]$/.test(keyToken)) {
-      return inputCode === `digit${keyToken}` || inputKey === keyToken;
+      return {
+        matched: inputCode === `digit${keyToken}` || inputKey === keyToken,
+        implicitShift: false,
+      };
     }
-    return inputKey === keyToken;
+    return { matched: inputKey === keyToken, implicitShift: false };
   }
 
   if (keyToken.startsWith('key') && keyToken.length === 4) {
-    return inputCode === keyToken || inputKey === keyToken.slice(3);
+    return {
+      matched: inputCode === keyToken || inputKey === keyToken.slice(3),
+      implicitShift: false,
+    };
   }
   if (keyToken.startsWith('digit') && keyToken.length === 6) {
-    return inputCode === keyToken || inputKey === keyToken.slice(5);
+    return {
+      matched: inputCode === keyToken || inputKey === keyToken.slice(5),
+      implicitShift: false,
+    };
   }
   if (/^f\d{1,2}$/.test(keyToken)) {
-    return inputCode === keyToken || inputKey === keyToken;
+    return {
+      matched: inputCode === keyToken || inputKey === keyToken,
+      implicitShift: false,
+    };
   }
 
   const mappedTokens: Record<string, { codes: string[]; keys: string[] }> = {
@@ -50,7 +68,7 @@ function matchesAcceleratorKeyToken(input: Electron.Input, keyToken: string): bo
     slash: { codes: ['slash'], keys: ['/'] },
     backslash: { codes: ['backslash'], keys: ['\\'] },
     minus: { codes: ['minus'], keys: ['-'] },
-    plus: { codes: ['equal'], keys: ['+'] },
+    plus: { codes: ['numpadadd'], keys: ['+'] },
     equal: { codes: ['equal'], keys: ['='] },
     comma: { codes: ['comma'], keys: [','] },
     period: { codes: ['period'], keys: ['.'] },
@@ -63,10 +81,13 @@ function matchesAcceleratorKeyToken(input: Electron.Input, keyToken: string): bo
 
   const mapping = mappedTokens[keyToken];
   if (!mapping) {
-    return false;
+    return { matched: false, implicitShift: false };
   }
 
-  return mapping.codes.includes(inputCode) || mapping.keys.includes(inputKey);
+  return {
+    matched: mapping.codes.includes(inputCode) || mapping.keys.includes(inputKey),
+    implicitShift: keyToken === 'plus' && inputKey === '+',
+  };
 }
 
 function normalizeModifierToken(token: string): string {
@@ -107,7 +128,8 @@ export function shortcutMatchesInputForLocalFallback(
     if (!allowedModifiers.has(token)) return false;
   }
 
-  if (!matchesAcceleratorKeyToken(input, keyToken)) {
+  const keyMatch = matchesAcceleratorKeyToken(input, keyToken);
+  if (!keyMatch.matched) {
     return false;
   }
 
@@ -117,7 +139,10 @@ export function shortcutMatchesInputForLocalFallback(
   const expectedControl = modifierTokens.has('control');
   const expectedCommandOrControl = modifierTokens.has('commandorcontrol');
 
-  if (Boolean(input.shift) !== expectedShift) return false;
+  const allowsImplicitShift = !expectedShift && keyMatch.implicitShift;
+  if (Boolean(input.shift) !== expectedShift && !(Boolean(input.shift) && allowsImplicitShift)) {
+    return false;
+  }
   if (Boolean(input.alt) !== expectedAlt) return false;
 
   if (expectedCommandOrControl) {

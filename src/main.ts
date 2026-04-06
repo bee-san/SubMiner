@@ -932,7 +932,14 @@ const youtubeFlowRuntime = createYoutubeFlowRuntime({
       const mediaPath =
         appState.currentMediaPath?.trim() || appState.mpvClient?.currentVideoPath?.trim() || '';
       const trackerFocused = tracker?.isTargetWindowFocused() ?? false;
-      if (tracker && tracker.isTracking() && trackerGeometry && trackerFocused && mediaPath) {
+      const requiresAuthoritativeFocus = tracker?.hasAuthoritativeFocus?.() ?? true;
+      if (
+        tracker &&
+        tracker.isTracking() &&
+        trackerGeometry &&
+        (!requiresAuthoritativeFocus || trackerFocused) &&
+        mediaPath
+      ) {
         if (!geometryMatches(stableGeometry, trackerGeometry)) {
           stableGeometry = trackerGeometry;
           stableSinceMs = Date.now();

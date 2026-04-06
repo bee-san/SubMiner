@@ -361,6 +361,37 @@ test('shortcutMatchesInputForLocalFallback ignores raw keydown events', () => {
   );
 });
 
+test('shortcutMatchesInputForLocalFallback treats Plus as a shifted plus key, not Equal', () => {
+  assert.equal(
+    shortcutMatchesInputForLocalFallback(
+      {
+        type: 'keyDown',
+        key: '+',
+        code: 'Equal',
+        control: true,
+        shift: true,
+      } as Electron.Input,
+      'Ctrl+Plus',
+      true,
+    ),
+    true,
+  );
+
+  assert.equal(
+    shortcutMatchesInputForLocalFallback(
+      {
+        type: 'keyDown',
+        key: '=',
+        code: 'Equal',
+        control: true,
+      } as Electron.Input,
+      'Ctrl+Plus',
+      true,
+    ),
+    false,
+  );
+});
+
 test('shouldActivateOverlayShortcuts disables macOS overlay shortcuts when tracked mpv is unfocused', () => {
   assert.equal(
     shouldActivateOverlayShortcuts({
