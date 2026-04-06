@@ -294,17 +294,6 @@ function isMpvWindow(window) {
   return false;
 }
 
-function isOverlayWindow(window) {
-  const values = [window.resourceClass, window.resourceName, window.caption];
-  for (const value of values) {
-    if (String(value || "").toLowerCase().includes("subminer")) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 function primeGeometryPreference(window) {
   if (window.clientGeometry) {
     geometryPreference.set(window, "client");
@@ -527,7 +516,7 @@ function ensureGeometryWatchers(window) {
 }
 
 function watchWindow(window) {
-  if (bridgeDisabled || !isWatchableWindow(window) || isOverlayWindow(window) || trackedWindows.has(window)) {
+  if (bridgeDisabled || !isWatchableWindow(window) || trackedWindows.has(window)) {
     return;
   }
 

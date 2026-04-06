@@ -443,3 +443,54 @@ test('initializeOverlayRuntime refreshes visible overlay when tracker focus chan
 
   assert.equal(visibilityRefreshCalls, 2);
 });
+
+test('initializeOverlayRuntime applies tracker geometry updates through Electron bounds', () => {
+  let boundsUpdateCalls = 0;
+  let visibilityRefreshCalls = 0;
+  const tracker = {
+    onGeometryChange: null as ((...args: unknown[]) => void) | null,
+    onWindowFound: null as ((...args: unknown[]) => void) | null,
+    onWindowLost: null as (() => void) | null,
+    onWindowFocusChange: null as ((focused: boolean) => void) | null,
+    start: () => {},
+  };
+
+  initializeOverlayRuntime({
+    backendOverride: null,
+    createMainWindow: () => {},
+    registerGlobalShortcuts: () => {},
+    updateVisibleOverlayBounds: () => {
+      boundsUpdateCalls += 1;
+    },
+    isVisibleOverlayVisible: () => true,
+    updateVisibleOverlayVisibility: () => {
+      visibilityRefreshCalls += 1;
+    },
+    getOverlayWindows: () => [],
+    syncOverlayShortcuts: () => {},
+    setWindowTracker: () => {},
+    getMpvSocketPath: () => '/tmp/mpv.sock',
+    createWindowTracker: () => tracker as never,
+    getResolvedConfig: () => ({
+      ankiConnect: { enabled: false } as never,
+    }),
+    getSubtitleTimingTracker: () => null,
+    getMpvClient: () => null,
+    getRuntimeOptionsManager: () => null,
+    setAnkiIntegration: () => {},
+    showDesktopNotification: () => {},
+    createFieldGroupingCallback: () => async () => ({
+      keepNoteId: 1,
+      deleteNoteId: 2,
+      deleteDuplicate: false,
+      cancelled: false,
+    }),
+    getKnownWordCacheStatePath: () => '/tmp/known-words-cache.json',
+  });
+
+  tracker.onGeometryChange?.({ x: 10, y: 20, width: 1280, height: 720 });
+  tracker.onWindowFound?.({ x: 10, y: 20, width: 1280, height: 720 });
+
+  assert.equal(boundsUpdateCalls, 2);
+  assert.equal(visibilityRefreshCalls, 2);
+});

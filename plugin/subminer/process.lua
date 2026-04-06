@@ -174,6 +174,25 @@ function M.create(ctx)
 		end
 	end
 
+	local function should_force_x11_overlay_host(backend)
+		if type(environment.is_linux) ~= "function" or not environment.is_linux() then
+			return false
+		end
+		return backend == "kwin" or backend == "x11"
+	end
+
+	local function prepend_x11_overlay_host_env(args)
+		local wrapped_args = {
+			"env",
+			"ELECTRON_OZONE_PLATFORM_HINT=x11",
+			"OZONE_PLATFORM=x11",
+		}
+		for _, arg in ipairs(args) do
+			wrapped_args[#wrapped_args + 1] = arg
+		end
+		return wrapped_args
+	end
+
 	local function build_command_args(action, overrides)
 		overrides = overrides or {}
 		local args = { state.binary_path }
@@ -206,6 +225,10 @@ function M.create(ctx)
 			local texthooker_enabled = resolve_texthooker_enabled(overrides.texthooker_enabled)
 			if texthooker_enabled then
 				table.insert(args, "--texthooker")
+			end
+
+			if should_force_x11_overlay_host(backend) then
+				args = prepend_x11_overlay_host_env(args)
 			end
 		end
 

@@ -10,6 +10,7 @@ import {
 } from './overlay-window-input';
 import { buildOverlayWindowOptions } from './overlay-window-options';
 import { normalizeOverlayWindowBoundsForPlatform } from './overlay-window-bounds';
+import { getOverlayWindowTitle } from '../../shared/overlay-window-titles';
 
 const logger = createLogger('main:overlay-window');
 const overlayWindowLayerByInstance = new WeakMap<BrowserWindow, OverlayWindowKind>();
@@ -81,6 +82,7 @@ export function createOverlayWindow(
   },
 ): BrowserWindow {
   const window = new BrowserWindow(buildOverlayWindowOptions(kind, options));
+  window.setTitle(getOverlayWindowTitle(kind));
 
   options.ensureOverlayWindowLevel(window);
   loadOverlayWindowLayer(window, kind);

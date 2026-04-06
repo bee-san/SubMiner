@@ -1,6 +1,7 @@
 import type { BrowserWindowConstructorOptions, Session } from 'electron';
 import * as path from 'path';
 import type { OverlayWindowKind } from './overlay-window-input';
+import { getOverlayWindowTitle } from '../../shared/overlay-window-titles';
 
 export function buildOverlayWindowOptions(
   kind: OverlayWindowKind,
@@ -13,6 +14,7 @@ export function buildOverlayWindowOptions(
 
   return {
     show: false,
+    title: getOverlayWindowTitle(kind),
     width: 800,
     height: 600,
     x: 0,

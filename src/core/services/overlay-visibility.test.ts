@@ -236,6 +236,7 @@ test('tracked KWin-style overlay stays visible without auto-focusing the window'
 
   assert.ok(calls.includes('mouse-ignore:false:plain'));
   assert.ok(calls.includes('show'));
+  assert.ok(calls.includes('update-bounds'));
   assert.ok(!calls.includes('focus'));
 });
 
