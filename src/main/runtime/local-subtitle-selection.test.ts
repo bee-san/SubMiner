@@ -51,6 +51,8 @@ test('resolveManagedLocalSubtitleSelection promotes a single unlabeled external 
 
   assert.equal(result.primaryTrackId, 2);
   assert.equal(result.secondaryTrackId, 1);
+  assert.equal(result.hasPrimaryMatch, false);
+  assert.equal(result.usedPrimaryFallback, true);
 });
 
 test('resolveManagedLocalSubtitleSelection does not guess between multiple unlabeled external sidecars', () => {
@@ -65,6 +67,23 @@ test('resolveManagedLocalSubtitleSelection does not guess between multiple unlab
 
   assert.equal(result.primaryTrackId, null);
   assert.equal(result.secondaryTrackId, 1);
+  assert.equal(result.usedPrimaryFallback, false);
+});
+
+test('resolveManagedLocalSubtitleSelection ignores descriptive external sidecar titles', () => {
+  const result = resolveManagedLocalSubtitleSelection({
+    trackList: [
+      { type: 'sub', id: 1, lang: 'eng', title: 'English ASS', external: false, selected: true },
+      { type: 'sub', id: 2, title: 'movie.en.srt', external: true },
+      { type: 'sub', id: 3, title: 'Signs & Songs.ass', external: true },
+    ],
+    primaryLanguages: [],
+    secondaryLanguages: [],
+  });
+
+  assert.equal(result.primaryTrackId, null);
+  assert.equal(result.secondaryTrackId, 1);
+  assert.equal(result.usedPrimaryFallback, false);
 });
 
 test('managed local subtitle selection runtime applies preferred tracks once for a local media path', async () => {
@@ -142,5 +161,45 @@ test('managed local subtitle selection runtime promotes a single unlabeled exter
   assert.deepEqual(commands, [
     ['set_property', 'sid', 2],
     ['set_property', 'secondary-sid', 1],
+  ]);
+});
+
+test('managed local subtitle selection runtime keeps fallback-only selection temporary', async () => {
+  const commands: Array<Array<string | number>> = [];
+  const scheduled: Array<() => void> = [];
+
+  const runtime = createManagedLocalSubtitleSelectionRuntime({
+    getCurrentMediaPath: () => '/videos/example.mkv',
+    getMpvClient: () =>
+      ({
+        connected: true,
+        requestProperty: async (name: string) => {
+          if (name === 'track-list') {
+            return [{ type: 'sub', id: 2, title: 'srt', external: true }];
+          }
+          throw new Error(`Unexpected property: ${name}`);
+        },
+      }) as never,
+    getPrimarySubtitleLanguages: () => [],
+    getSecondarySubtitleLanguages: () => [],
+    sendMpvCommand: (command) => {
+      commands.push(command);
+    },
+    schedule: (callback) => {
+      scheduled.push(callback);
+      return 1 as never;
+    },
+    clearScheduled: () => {},
+  });
+
+  runtime.handleMediaPathChange('/videos/example.mkv');
+  scheduled.shift()?.();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  runtime.handleSubtitleTrackListChange(mixedLanguageTrackList);
+
+  assert.deepEqual(commands, [
+    ['set_property', 'sid', 2],
+    ['set_property', 'sid', 12],
+    ['set_property', 'secondary-sid', 11],
   ]);
 });

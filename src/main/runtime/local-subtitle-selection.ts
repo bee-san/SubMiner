@@ -6,6 +6,7 @@ import { normalizeYoutubeLangCode } from '../../core/services/youtube/labels';
 const DEFAULT_PRIMARY_SUBTITLE_LANGUAGES = ['ja', 'jpn'];
 const DEFAULT_SECONDARY_SUBTITLE_LANGUAGES = ['en', 'eng', 'english', 'enus', 'en-us'];
 const HEARING_IMPAIRED_PATTERN = /\b(hearing impaired|sdh|closed captions?|cc)\b/i;
+const GENERIC_EXTERNAL_SUBTITLE_TITLES = new Set(['srt', 'subrip', 'ass', 'ssa', 'vtt', 'webvtt']);
 
 type SubtitleTrackLike = {
   type?: unknown;
@@ -29,6 +30,7 @@ export type ManagedLocalSubtitleSelection = {
   secondaryTrackId: number | null;
   hasPrimaryMatch: boolean;
   hasSecondaryMatch: boolean;
+  usedPrimaryFallback: boolean;
 };
 
 function parseTrackId(value: unknown): number | null {
@@ -90,8 +92,21 @@ function isLikelyHearingImpaired(title: string): boolean {
   return HEARING_IMPAIRED_PATTERN.test(title);
 }
 
+function hasGenericUnlabeledSubtitleTitle(title: string): boolean {
+  const normalized = title.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  const withoutLeadingDot = normalized.startsWith('.') ? normalized.slice(1) : normalized;
+  return GENERIC_EXTERNAL_SUBTITLE_TITLES.has(withoutLeadingDot);
+}
+
 function isUnlabeledExternalTrack(track: NormalizedSubtitleTrack): boolean {
-  return track.external && normalizeYoutubeLangCode(track.lang).length === 0;
+  return (
+    track.external &&
+    normalizeYoutubeLangCode(track.lang).length === 0 &&
+    hasGenericUnlabeledSubtitleTitle(track.title)
+  );
 }
 
 function pickBestTrackId(
@@ -169,8 +184,9 @@ export function resolveManagedLocalSubtitleSelection(input: {
   return {
     primaryTrackId,
     secondaryTrackId: secondary.trackId,
-    hasPrimaryMatch: primary.hasMatch || primaryTrackId !== null,
+    hasPrimaryMatch: primary.hasMatch,
     hasSecondaryMatch: secondary.hasMatch,
+    usedPrimaryFallback: primary.trackId === null && primaryTrackId !== null,
   };
 }
 
@@ -201,6 +217,7 @@ export function createManagedLocalSubtitleSelectionRuntime(deps: {
   const delayMs = deps.delayMs ?? 400;
   let currentMediaPath: string | null = null;
   let appliedMediaPath: string | null = null;
+  let lastAppliedSelectionSignature: string | null = null;
   let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 
   const clearPendingTimer = (): void => {
@@ -220,7 +237,11 @@ export function createManagedLocalSubtitleSelectionRuntime(deps: {
       primaryLanguages: deps.getPrimarySubtitleLanguages(),
       secondaryLanguages: deps.getSecondarySubtitleLanguages(),
     });
-    if (!selection.hasPrimaryMatch && !selection.hasSecondaryMatch) {
+    if (selection.primaryTrackId === null && selection.secondaryTrackId === null) {
+      return;
+    }
+    const selectionSignature = `${selection.primaryTrackId ?? 'auto'}:${selection.secondaryTrackId ?? 'auto'}:${selection.usedPrimaryFallback ? 'fallback' : 'final'}`;
+    if (selectionSignature === lastAppliedSelectionSignature) {
       return;
     }
     if (selection.primaryTrackId !== null) {
@@ -228,6 +249,10 @@ export function createManagedLocalSubtitleSelectionRuntime(deps: {
     }
     if (selection.secondaryTrackId !== null) {
       deps.sendMpvCommand(['set_property', 'secondary-sid', selection.secondaryTrackId]);
+    }
+    lastAppliedSelectionSignature = selectionSignature;
+    if (selection.usedPrimaryFallback) {
+      return;
     }
     appliedMediaPath = currentMediaPath;
     clearPendingTimer();
@@ -266,6 +291,7 @@ export function createManagedLocalSubtitleSelectionRuntime(deps: {
       const normalizedPath = normalizeLocalMediaPath(mediaPath);
       if (normalizedPath !== currentMediaPath) {
         appliedMediaPath = null;
+        lastAppliedSelectionSignature = null;
       }
       currentMediaPath = normalizedPath;
       if (!currentMediaPath) {
